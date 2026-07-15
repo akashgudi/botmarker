@@ -1,0 +1,6 @@
+.env
+.env.example
+jobs.json
+__pycache__/
+*.pyc
+.git/
