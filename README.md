@@ -56,3 +56,13 @@ Feeds are set via `FEEDS_JSON` in `.env` (see above). Page count and staleness c
 ## Deployment
 
 A `Dockerfile` is included for deploying the bot as a persistent, always-on service (based on Playwright's official image, which ships Chromium preinstalled). Point any container host (Railway, Fly.io, a VPS, etc.) at it and set the same environment variables as your `.env` file in that platform's dashboard — never commit real secrets into the image.
+
+## Features
+
+- **Multi-feed scraping** — configure any number of (search URL, channel) pairs via `FEEDS_JSON`; each feed is scraped and posted independently, and listings matching multiple feeds' filters are posted to every matching channel.
+- **Automatic polling** — scrapes every 15 minutes on a background loop, posting only newly-found listings.
+- **Deduplication** — listings are upserted into MongoDB keyed on their link, with a separate per-(feed, link) tracking collection so a listing is never reposted to a channel it's already been sent to.
+- **Rich embeds** — each posting includes title, company, location, position type, compensation, a dynamic viewer-local posted time, and the company logo as a thumbnail.
+- **Forum channel support** — if a feed's target channel is a Discord forum, each listing is posted as its own thread instead of a plain message.
+- **Save-for-later via reaction** — reacting 🔖 on a listing DMs that listing's embed to the reacting user, and works even on listings posted before the bot's current process started.
+- **`/search` slash command** — search stored job listings by keyword against title/company/location/type and get the top matches back as embeds.
