@@ -5,12 +5,15 @@ unique Mongo index on `link`).
 
 Requires: pip install discord.py python-dotenv
 Env vars: DISCORD_TOKEN, DISCORD_CHANNEL_ID, MONGO_URI (optional, see test_scraper.py)
-Loaded from a .env file in this directory (see .env.example).
+Loaded from a .env file in this directory.
 """
 
 import asyncio
 import os
 
+# Must run before importing test_scraper - its Mongo config constants are read
+# from os.environ at import time, so .env has to be loaded first or they'd
+# pick up the hardcoded fallback defaults instead of your real values.
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -47,9 +50,15 @@ def job_embed(job: dict) -> discord.Embed:
 async def poll_jobs():
     channel = client.get_channel(DISCORD_CHANNEL_ID)
     if channel is None:
+        # get_channel reads from the gateway cache only - this fires if the bot
+        # was never invited to the server that channel belongs to (or the ID is
+        # wrong), not just if the channel doesn't exist.
         print(f"Channel {DISCORD_CHANNEL_ID} not found")
         return
 
+    # scrape_and_store is synchronous (Playwright's sync API + pymongo), so it
+    # would block the whole event loop - including Discord's heartbeat - for
+    # the duration of the scrape. to_thread runs it off the event loop instead.
     new_jobs = await asyncio.to_thread(scrape_and_store)
     for job in new_jobs:
         await channel.send(embed=job_embed(job))

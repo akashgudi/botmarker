@@ -29,9 +29,15 @@ OUTPUT_FILE = "jobs.json"
 REQUEST_TIMEOUT = 30_000              # milliseconds
 USER_AGENT = "Mozilla/5.0 (compatible; JobLinkScraper/1.0)"
 
+# Mongo connection - falls back to a local instance if env vars aren't set,
+# so the script still runs (against an empty local DB) without a .env file.
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.environ.get("MONGO_DB", "job_scraper")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "jobs")
+
+# CSS path to the job list container, copied from the rendered DOM (hitmarker.net
+# is a client-rendered SPA, so this is Tailwind's generated classes, not
+# hand-written markup - backslashes escape the ':' and '[...]' inside class names).
 JOB_LIST_SELECTOR = (
     "#app > div.px-4.md\\:px-8.mt-8 > div > "
     "div.grid.grid-cols-1.lg\\:grid-cols-\\[minmax\\(0\\,1fr\\)_300px\\]."
@@ -105,6 +111,9 @@ def parse_job_card(anchor, base_url: str) -> dict:
         "link": link,
     }
 
+    # Each job card row is an icon + label pair (location emoji, company logo,
+    # contract type, salary, post date) - there's no data attribute naming the
+    # field, so the icon's alt text / class is the only way to tell rows apart.
     for row in anchor.find_all("div", class_=lambda c: c == "gap-x-1.5"):
         img = row.find("img")
         truncate_el = row.select_one("span.truncate")
@@ -144,6 +153,9 @@ def posted_within(job: dict, max_age: timedelta) -> bool:
 
 
 def extract_jobs(html: str, base_url: str, seen_links: set | None = None) -> list[dict]:
+    # seen_links is shared across pages by the caller (scrape_and_store) so a
+    # listing that happens to appear on more than one page - promoted/pinned
+    # jobs do this - only gets parsed and counted once.
     if seen_links is None:
         seen_links = set()
 
@@ -159,6 +171,7 @@ def extract_jobs(html: str, base_url: str, seen_links: set | None = None) -> lis
         absolute_url = urljoin(base_url, anchor["href"])
         path = urlparse(absolute_url).path
 
+        # Only real job postings, e.g. reject "/jobs" itself or "/jobs/" with nothing after it.
         if not (path.startswith(JOBS_PATH_PREFIX) and len(path) > len(JOBS_PATH_PREFIX)):
             continue
         if absolute_url in seen_links:
