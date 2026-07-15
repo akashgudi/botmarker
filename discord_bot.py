@@ -11,6 +11,7 @@ Loaded from a .env file in this directory.
 
 import asyncio
 import os
+from datetime import datetime
 
 # Must run before importing test_scraper - its Mongo config constants are read
 # from os.environ at import time, so .env has to be loaded first or they'd
@@ -53,8 +54,13 @@ def job_embed(job: dict) -> discord.Embed:
         embed.add_field(name="Type", value=job["position_type"], inline=True)
     if job.get("compensation"):
         embed.add_field(name="Compensation", value=job["compensation"], inline=True)
-    if job.get("date_posted"):
-        embed.set_footer(text=job["date_posted"])
+    if job.get("posted_at"):
+        # embed.timestamp renders as a dynamic, viewer-local time next to the
+        # footer (e.g. "Today at 3:45 PM") instead of a static string.
+        try:
+            embed.timestamp = datetime.fromisoformat(job["posted_at"].replace("Z", "+00:00"))
+        except ValueError:
+            pass
     if job.get("company_logo"):
         embed.set_thumbnail(url=job["company_logo"])
     return embed
@@ -78,7 +84,17 @@ async def poll_jobs():
         # Playwright browser open per poll cycle.
         new_jobs = await asyncio.to_thread(scrape_and_store, feed)
         for job in new_jobs:
-            message = await channel.send(embed=job_embed(job))
+            embed = job_embed(job)
+            if isinstance(channel, discord.ForumChannel):
+                # Forum channels have no .send() - each listing has to become its
+                # own post (thread), which requires a name and a starter message.
+                thread_with_message = await channel.create_thread(
+                    name=(job.get("title") or "New job listing")[:100],
+                    embed=embed,
+                )
+                message = thread_with_message.message
+            else:
+                message = await channel.send(embed=embed)
             await message.add_reaction(SAVE_EMOJI)
 
 
