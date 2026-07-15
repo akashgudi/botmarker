@@ -1,2 +1,4 @@
 .env
 .claude
+temp.json
+read_temp.mjs

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -22,8 +23,14 @@ from pymongo.errors import PyMongoError
 load_dotenv()
 
 # ---- Configuration ----------------------------------------------------
-TARGET_URL = "https://hitmarker.net/jobs?location=233&contract=internship+fullTime&level=intermediate+junior+entry"  # <-- set the page to scrape
-NUM_PAGES = 3                         # click through pages 1..NUM_PAGES of results
+# Each feed is an independent hitmarker.net search-results URL (its filters baked
+# into the query string) that gets posted to its own Discord channel - see
+# discord_bot.py's poll_jobs. Configured as a JSON array in .env, e.g.:
+#   FEEDS_JSON=[{"name": "US Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "123..."}]
+# test_scraper.py itself only reads name/url; channel_id is carried through for
+# discord_bot.py to use.
+FEEDS: list[dict] = json.loads(os.environ.get("FEEDS_JSON", "[]"))
+NUM_PAGES = 3                         # click through pages 1..NUM_PAGES of results, per feed
 JOBS_PATH_PREFIX = "/jobs/"          # matches url.com/jobs/<anything>
 OUTPUT_FILE = "jobs.json"
 REQUEST_TIMEOUT = 30_000              # milliseconds
@@ -34,6 +41,11 @@ USER_AGENT = "Mozilla/5.0 (compatible; JobLinkScraper/1.0)"
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.environ.get("MONGO_DB", "job_scraper")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "jobs")
+# Tracks which (feed, link) pairs have already been reported as new, separately
+# from `jobs` - so a listing matching more than one feed's filters still gets
+# surfaced to each matching feed's channel, even though its content (in `jobs`)
+# is only stored once.
+POSTED_COLLECTION = os.environ.get("MONGO_POSTED_COLLECTION", "posted_jobs")
 
 # CSS path to the job list container, copied from the rendered DOM (hitmarker.net
 # is a client-rendered SPA, so this is Tailwind's generated classes, not
@@ -59,8 +71,8 @@ MAX_AGE = timedelta(hours=48)
 FIRST_JOB_LINK_SELECTOR = f"{JOB_LIST_SELECTOR} a[href*='/jobs/']"
 
 
-def fetch_pages(num_pages: int) -> list[str]:
-    """Load the target URL, then click through the pager, capturing each page's HTML.
+def fetch_pages(num_pages: int, target_url: str) -> list[str]:
+    """Load target_url, then click through the pager, capturing each page's HTML.
 
     The pager's active-page indicator updates optimistically on click, before the
     async data fetch behind it resolves - so it can't be used to tell whether the
@@ -71,7 +83,7 @@ def fetch_pages(num_pages: int) -> list[str]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=USER_AGENT)
-        page.goto(TARGET_URL, timeout=REQUEST_TIMEOUT, wait_until="domcontentloaded")
+        page.goto(target_url, timeout=REQUEST_TIMEOUT, wait_until="domcontentloaded")
         page.wait_for_selector(WAIT_FOR_SELECTOR, timeout=REQUEST_TIMEOUT)
         htmls.append(page.content())
 
@@ -103,6 +115,7 @@ def parse_job_card(anchor, base_url: str) -> dict:
     job = {
         "title": title,
         "company": None,
+        "company_logo": None,
         "location": None,
         "position_type": None,
         "compensation": None,
@@ -128,6 +141,8 @@ def parse_job_card(anchor, base_url: str) -> dict:
             job["location"] = text
         elif alt.endswith(" logo"):
             job["company"] = text
+            if img.get("src"):
+                job["company_logo"] = urljoin(base_url, img["src"])
         elif alt == "Contract":
             job["position_type"] = text
         elif alt == "Salary":
@@ -193,63 +208,143 @@ def get_jobs_collection():
     return collection
 
 
-def save_new_jobs(jobs: list[dict], collection=None) -> list[dict]:
-    """Upsert jobs keyed on `link`, returning only the ones that didn't already exist.
+def get_posted_collection():
+    """Connect and make sure (feed, link) is unique, so a feed can't double-post a link."""
+    client = MongoClient(MONGO_URI)
+    collection = client[MONGO_DB][POSTED_COLLECTION]
+    collection.create_index([("feed", 1), ("link", 1)], unique=True)
+    return collection
 
-    Uses one bulk_write of per-job upserts instead of N round trips, and reads
-    upserted_id back per-operation to tell "new" from "already seen" without a
-    separate existence check.
+
+def save_new_jobs(
+    jobs: list[dict],
+    feed_name: str,
+    jobs_collection=None,
+    posted_collection=None,
+) -> list[dict]:
+    """Store job content once, but track "new" independently per feed.
+
+    Two collections because dedup happens at two different scopes: `jobs` stores
+    each listing once no matter how many feeds' filters it matches, while
+    `posted_collection` upserts a (feed, link) row per feed - so a listing that
+    matches two feeds is still reported as new to both, even though the second
+    feed's upsert into `jobs` is a no-op.
+
+    Uses one bulk_write per collection instead of N round trips, and reads
+    upserted_ids back to tell "new to this feed" from "already posted to this
+    feed" without a separate existence check.
     """
     if not jobs:
         return []
 
-    owns_client = collection is None
-    if owns_client:
-        collection = get_jobs_collection()
-
-    operations = [
-        UpdateOne({"link": job["link"]}, {"$setOnInsert": job}, upsert=True)
-        for job in jobs
-    ]
+    owns_jobs = jobs_collection is None
+    owns_posted = posted_collection is None
+    if owns_jobs:
+        jobs_collection = get_jobs_collection()
+    if owns_posted:
+        posted_collection = get_posted_collection()
 
     try:
-        result = collection.bulk_write(operations, ordered=False)
-    except PyMongoError as e:
-        print(f"Mongo bulk_write failed: {e}")
-        return []
+        content_ops = [
+            UpdateOne({"link": job["link"]}, {"$setOnInsert": job}, upsert=True)
+            for job in jobs
+        ]
+        try:
+            jobs_collection.bulk_write(content_ops, ordered=False)
+        except PyMongoError as e:
+            print(f"Mongo bulk_write (jobs) failed: {e}")
+            return []
+
+        posted_ops = [
+            UpdateOne(
+                {"feed": feed_name, "link": job["link"]},
+                {"$setOnInsert": {"feed": feed_name, "link": job["link"]}},
+                upsert=True,
+            )
+            for job in jobs
+        ]
+        try:
+            result = posted_collection.bulk_write(posted_ops, ordered=False)
+        except PyMongoError as e:
+            print(f"Mongo bulk_write (posted) failed: {e}")
+            return []
     finally:
-        if owns_client:
-            collection.database.client.close()
+        if owns_jobs:
+            jobs_collection.database.client.close()
+        if owns_posted:
+            posted_collection.database.client.close()
 
     new_indices = set(result.upserted_ids.keys())
     return [job for i, job in enumerate(jobs) if i in new_indices]
 
 
-def scrape_and_store() -> list[dict]:
-    """Scrape up to NUM_PAGES of results and persist only newly-seen jobs. Returns the new ones."""
-    htmls = fetch_pages(NUM_PAGES)
+def search_jobs(keyword: str, limit: int = 5, collection=None) -> list[dict]:
+    """Case-insensitive substring search over stored jobs, most recently posted first.
+
+    Matches against title/company/location/position_type - posted_at is stored as
+    an ISO 8601 string (see parse_job_card), which sorts lexicographically the
+    same as chronologically, so no datetime parsing is needed here.
+    """
+    owns_client = collection is None
+    if owns_client:
+        collection = get_jobs_collection()
+
+    try:
+        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+        query = {
+            "$or": [
+                {"title": pattern},
+                {"company": pattern},
+                {"location": pattern},
+                {"position_type": pattern},
+            ]
+        }
+        cursor = (
+            collection.find(query, {"_id": 0})
+            .sort("posted_at", -1)
+            .limit(limit)
+        )
+        return list(cursor)
+    finally:
+        if owns_client:
+            collection.database.client.close()
+
+
+def scrape_and_store(feed: dict) -> list[dict]:
+    """Scrape up to NUM_PAGES of results for one feed, persist, and return newly-posted jobs.
+
+    "New" is tracked per feed (see save_new_jobs), so the same listing can be
+    returned for more than one feed if it matches more than one feed's filters.
+    """
+    htmls = fetch_pages(NUM_PAGES, feed["url"])
 
     seen_links = set()
     jobs = []
     for html in htmls:
-        jobs.extend(extract_jobs(html, TARGET_URL, seen_links))
+        jobs.extend(extract_jobs(html, feed["url"], seen_links))
 
-    new_jobs = save_new_jobs(jobs)
+    new_jobs = save_new_jobs(jobs, feed["name"])
 
+    max_age_hours = int(MAX_AGE.total_seconds() // 3600)
     print(
-        f"Found {len(jobs)} job listing(s) across {len(htmls)} page(s) posted in the last 24 hours "
-        f"({len(new_jobs)} new, {len(jobs) - len(new_jobs)} already in the database)"
+        f"[{feed['name']}] Found {len(jobs)} job listing(s) across {len(htmls)} page(s) posted in the last "
+        f"{max_age_hours}h ({len(new_jobs)} new for this feed, {len(jobs) - len(new_jobs)} already posted to it)"
     )
     return new_jobs
 
 
 def main():
-    new_jobs = scrape_and_store()
+    if not FEEDS:
+        print("No feeds configured - set FEEDS_JSON in .env")
+        return
+
+    results = {feed["name"]: scrape_and_store(feed) for feed in FEEDS}
 
     with open(OUTPUT_FILE, "w") as f:
-        json.dump(new_jobs, f, indent=2)
+        json.dump(results, f, indent=2)
 
-    print(f"Wrote {len(new_jobs)} new job listing(s) to {OUTPUT_FILE}")
+    total_new = sum(len(jobs) for jobs in results.values())
+    print(f"Wrote {total_new} new job listing(s) across {len(FEEDS)} feed(s) to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":

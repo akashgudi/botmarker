@@ -1,10 +1,11 @@
 """
-Discord bot that periodically scrapes job listings and posts only the ones
-not already seen (dedup is handled in test_scraper.save_new_jobs via a
-unique Mongo index on `link`).
+Discord bot that periodically scrapes each configured feed and posts only the
+listings not already posted to that feed's channel (dedup is handled in
+test_scraper.save_new_jobs via a unique Mongo index on `link` plus a
+per-(feed, link) posted-tracking collection).
 
 Requires: pip install discord.py python-dotenv
-Env vars: DISCORD_TOKEN, DISCORD_CHANNEL_ID, MONGO_URI (optional, see test_scraper.py)
+Env vars: DISCORD_TOKEN, FEEDS_JSON, MONGO_URI (optional, see test_scraper.py)
 Loaded from a .env file in this directory.
 """
 
@@ -19,16 +20,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import discord
+from discord import app_commands
 from discord.ext import tasks
 
-from test_scraper import scrape_and_store
+from test_scraper import FEEDS, scrape_and_store, search_jobs
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-DISCORD_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
+# Optional: set this to a guild ID for instant command sync while testing -
+# guild-scoped syncs apply immediately, global ones take up to an hour to
+# propagate to Discord clients.
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 POLL_MINUTES = 15
+# Reacting with this emoji on a job listing DMs the reacting user that listing,
+# as a bookmark/save-for-later.
+SAVE_EMOJI = "🔖"
+
+if not FEEDS:
+    raise RuntimeError("No feeds configured - set FEEDS_JSON in .env (see test_scraper.py)")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
 
 def job_embed(job: dict) -> discord.Embed:
@@ -43,30 +55,83 @@ def job_embed(job: dict) -> discord.Embed:
         embed.add_field(name="Compensation", value=job["compensation"], inline=True)
     if job.get("date_posted"):
         embed.set_footer(text=job["date_posted"])
+    if job.get("company_logo"):
+        embed.set_thumbnail(url=job["company_logo"])
     return embed
 
 
 @tasks.loop(minutes=POLL_MINUTES)
 async def poll_jobs():
-    channel = client.get_channel(DISCORD_CHANNEL_ID)
-    if channel is None:
-        # get_channel reads from the gateway cache only - this fires if the bot
-        # was never invited to the server that channel belongs to (or the ID is
-        # wrong), not just if the channel doesn't exist.
-        print(f"Channel {DISCORD_CHANNEL_ID} not found")
+    for feed in FEEDS:
+        channel = client.get_channel(int(feed["channel_id"]))
+        if channel is None:
+            # get_channel reads from the gateway cache only - this fires if the bot
+            # was never invited to the server that channel belongs to (or the ID is
+            # wrong), not just if the channel doesn't exist.
+            print(f"[{feed['name']}] channel {feed['channel_id']} not found")
+            continue
+
+        # scrape_and_store is synchronous (Playwright's sync API + pymongo), so it
+        # would block the whole event loop - including Discord's heartbeat - for
+        # the duration of the scrape. to_thread runs it off the event loop instead.
+        # Feeds are scraped one at a time (not concurrently) to keep at most one
+        # Playwright browser open per poll cycle.
+        new_jobs = await asyncio.to_thread(scrape_and_store, feed)
+        for job in new_jobs:
+            message = await channel.send(embed=job_embed(job))
+            await message.add_reaction(SAVE_EMOJI)
+
+
+@tree.command(name="search", description="Search stored job listings by keyword")
+@app_commands.describe(keyword="Word or phrase to match against title/company/location/type")
+async def search(interaction: discord.Interaction, keyword: str):
+    await interaction.response.defer()
+
+    # search_jobs hits Mongo synchronously - to_thread keeps it off the event loop.
+    jobs = await asyncio.to_thread(search_jobs, keyword, 5)
+
+    if not jobs:
+        await interaction.followup.send(f"No jobs found matching '{keyword}'.")
         return
 
-    # scrape_and_store is synchronous (Playwright's sync API + pymongo), so it
-    # would block the whole event loop - including Discord's heartbeat - for
-    # the duration of the scrape. to_thread runs it off the event loop instead.
-    new_jobs = await asyncio.to_thread(scrape_and_store)
-    for job in new_jobs:
-        await channel.send(embed=job_embed(job))
+    await interaction.followup.send(embeds=[job_embed(job) for job in jobs])
+
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # Raw (not cached-message) event, so this fires even for listings sent before
+    # the bot's current process started - a plain on_reaction_add only fires for
+    # messages discord.py already has in its message cache.
+    if payload.user_id == client.user.id or str(payload.emoji) != SAVE_EMOJI:
+        return
+
+    try:
+        channel = client.get_channel(payload.channel_id) or await client.fetch_channel(payload.channel_id)
+        message = await channel.fetch_message(payload.message_id)
+    except discord.HTTPException as e:
+        print(f"Could not fetch reacted-to message {payload.message_id}: {e}")
+        return
+    if not message.embeds:
+        return
+
+    try:
+        user = client.get_user(payload.user_id) or await client.fetch_user(payload.user_id)
+        await user.send(embed=message.embeds[0])
+    except discord.Forbidden:
+        print(f"Could not DM user {payload.user_id} (DMs closed)")
 
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
+
+    if DISCORD_GUILD_ID:
+        guild = discord.Object(id=int(DISCORD_GUILD_ID))
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+    else:
+        await tree.sync()
+
     if not poll_jobs.is_running():
         poll_jobs.start()
 

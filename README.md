@@ -4,8 +4,8 @@ Scrapes job listings from [hitmarker.net](https://hitmarker.net) and posts new o
 
 ## How it works
 
-- **`test_scraper.py`** — loads the target search results page with Playwright, clicks through pagination (hitmarker's pager is JS-driven, not URL-based), and parses each job card with BeautifulSoup. Listings are upserted into MongoDB keyed on their link, so a listing already in the database is never reprocessed or reposted.
-- **`discord_bot.py`** — a Discord bot that runs the scraper every 15 minutes and posts an embed for each newly-found listing to a configured channel.
+- **`test_scraper.py`** — loads a target search results page with Playwright, clicks through pagination (hitmarker's pager is JS-driven, not URL-based), and parses each job card with BeautifulSoup. Listing content is upserted into MongoDB keyed on its link (stored once no matter how many feeds match it); a separate collection tracks which (feed, link) pairs have already been reported, so the same listing can still be posted to every feed's channel whose filters it matches.
+- **`discord_bot.py`** — a Discord bot that, every 15 minutes, runs the scraper once per configured feed and posts an embed for each newly-found listing to that feed's channel.
 
 ## Setup
 
@@ -18,15 +18,19 @@ Scrapes job listings from [hitmarker.net](https://hitmarker.net) and posts new o
 2. Create a `.env` file in this directory:
    ```
    DISCORD_TOKEN=your-bot-token
-   DISCORD_CHANNEL_ID=the-channel-id-to-post-to
+
+   # One entry per (search URL, channel) pair - add as many as you like, each
+   # with its own filters baked into the URL's query string.
+   FEEDS_JSON=[{"name": "Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "111..."}, {"name": "Full-time", "url": "https://hitmarker.net/jobs?...", "channel_id": "222..."}]
 
    MONGO_URI=mongodb://localhost:27017
    MONGO_DB=job_scraper
    MONGO_COLLECTION=jobs
+   MONGO_POSTED_COLLECTION=posted_jobs
    ```
-   `MONGO_URI` can point at a local MongoDB instance or a hosted one (e.g. MongoDB Atlas).
+   `MONGO_URI` can point at a local MongoDB instance or a hosted one (e.g. MongoDB Atlas). If a listing matches more than one feed's filters, it's posted to every matching feed's channel independently.
 
-3. Create a bot application in the [Discord Developer Portal](https://discord.com/developers/applications), invite it to your server with the `Send Messages` and `Embed Links` permissions, and use its channel ID for `DISCORD_CHANNEL_ID`.
+3. Create a bot application in the [Discord Developer Portal](https://discord.com/developers/applications), invite it to your server with the `Send Messages` and `Embed Links` permissions, and use its channel IDs in `FEEDS_JSON`.
 
 ## Running
 
@@ -42,12 +46,11 @@ python discord_bot.py
 
 ## Configuration
 
-Search parameters, page count, and staleness cutoff are set at the top of `test_scraper.py`:
+Feeds are set via `FEEDS_JSON` in `.env` (see above). Page count and staleness cutoff are shared across all feeds and set at the top of `test_scraper.py`:
 
 | Constant | Purpose |
 |---|---|
-| `TARGET_URL` | The hitmarker.net search results URL to scrape |
-| `NUM_PAGES` | How many pages of results to click through |
+| `NUM_PAGES` | How many pages of results to click through, per feed |
 | `MAX_AGE` | Only keep listings posted within this window |
 
 ## Deployment
