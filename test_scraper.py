@@ -25,11 +25,16 @@ load_dotenv()
 # ---- Configuration ----------------------------------------------------
 # Each feed is an independent hitmarker.net search-results URL (its filters baked
 # into the query string) that gets posted to its own Discord channel - see
-# discord_bot.py's poll_jobs. Configured as a JSON array in .env, e.g.:
-#   FEEDS_JSON=[{"name": "US Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "123..."}]
+# discord_bot.py's poll_jobs. Configured as a JSON array in FEEDS_FILE, e.g.:
+#   [{"name": "US Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "123..."}]
 # test_scraper.py itself only reads name/url; channel_id is carried through for
 # discord_bot.py to use.
-FEEDS: list[dict] = json.loads(os.environ.get("FEEDS_JSON", "[]"))
+FEEDS_FILE = os.environ.get("FEEDS_FILE", "feeds.json")
+if os.path.exists(FEEDS_FILE):
+    with open(FEEDS_FILE, encoding="utf-8") as f:
+        FEEDS: list[dict] = json.load(f)
+else:
+    FEEDS = []
 NUM_PAGES = 3                         # click through pages 1..NUM_PAGES of results, per feed
 JOBS_PATH_PREFIX = "/jobs/"          # matches url.com/jobs/<anything>
 OUTPUT_FILE = "jobs.json"
@@ -335,7 +340,7 @@ def scrape_and_store(feed: dict) -> list[dict]:
 
 def main():
     if not FEEDS:
-        print("No feeds configured - set FEEDS_JSON in .env")
+        print("No feeds configured - add entries to feeds.json")
         return
 
     results = {feed["name"]: scrape_and_store(feed) for feed in FEEDS}

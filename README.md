@@ -19,18 +19,23 @@ Scrapes job listings from [hitmarker.net](https://hitmarker.net) and posts new o
    ```
    DISCORD_TOKEN=your-bot-token
 
-   # One entry per (search URL, channel) pair - add as many as you like, each
-   # with its own filters baked into the URL's query string.
-   FEEDS_JSON=[{"name": "Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "111..."}, {"name": "Full-time", "url": "https://hitmarker.net/jobs?...", "channel_id": "222..."}]
-
    MONGO_URI=mongodb://localhost:27017
    MONGO_DB=job_scraper
    MONGO_COLLECTION=jobs
    MONGO_POSTED_COLLECTION=posted_jobs
    ```
-   `MONGO_URI` can point at a local MongoDB instance or a hosted one (e.g. MongoDB Atlas). If a listing matches more than one feed's filters, it's posted to every matching feed's channel independently.
+   `MONGO_URI` can point at a local MongoDB instance or a hosted one (e.g. MongoDB Atlas).
 
-3. Create a bot application in the [Discord Developer Portal](https://discord.com/developers/applications), invite it to your server with the `Send Messages` and `Embed Links` permissions, and use its channel IDs in `FEEDS_JSON`.
+3. Create a `feeds.json` file in this directory - one entry per (search URL, channel) pair, add as many as you like, each with its own filters baked into the URL's query string:
+   ```json
+   [
+     {"name": "Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "111..."},
+     {"name": "Full-time", "url": "https://hitmarker.net/jobs?...", "channel_id": "222..."}
+   ]
+   ```
+   It's read once at process start (both `test_scraper.py` and `discord_bot.py`); restart the process after editing it. If a listing matches more than one feed's filters, it's posted to every matching feed's channel independently. Point `FEEDS_FILE` at a different path if you don't want to use `feeds.json`.
+
+4. Create a bot application in the [Discord Developer Portal](https://discord.com/developers/applications), invite it to your server with the `Send Messages` and `Embed Links` permissions, and use its channel IDs in `feeds.json`.
 
 ## Running
 
@@ -46,7 +51,7 @@ python discord_bot.py
 
 ## Configuration
 
-Feeds are set via `FEEDS_JSON` in `.env` (see above). Page count and staleness cutoff are shared across all feeds and set at the top of `test_scraper.py`:
+Feeds are set in `feeds.json` (see above). Page count and staleness cutoff are shared across all feeds and set at the top of `test_scraper.py`:
 
 | Constant | Purpose |
 |---|---|
@@ -55,11 +60,11 @@ Feeds are set via `FEEDS_JSON` in `.env` (see above). Page count and staleness c
 
 ## Deployment
 
-A `Dockerfile` is included for deploying the bot as a persistent, always-on service (based on Playwright's official image, which ships Chromium preinstalled). Point any container host (Railway, Fly.io, a VPS, etc.) at it and set the same environment variables as your `.env` file in that platform's dashboard — never commit real secrets into the image.
+A `Dockerfile` is included for deploying the bot as a persistent, always-on service (based on Playwright's official image, which ships Chromium preinstalled). Point any container host (Railway, Fly.io, a VPS, etc.) at it and set the same environment variables as your `.env` file in that platform's dashboard — never commit real secrets into the image. `feeds.json` is copied in as part of the image (`COPY . .`), so update it and rebuild/redeploy to change feeds.
 
 ## Features
 
-- **Multi-feed scraping** — configure any number of (search URL, channel) pairs via `FEEDS_JSON`; each feed is scraped and posted independently, and listings matching multiple feeds' filters are posted to every matching channel.
+- **Multi-feed scraping** — configure any number of (search URL, channel) pairs via `feeds.json`; each feed is scraped and posted independently, and listings matching multiple feeds' filters are posted to every matching channel.
 - **Automatic polling** — scrapes every 15 minutes on a background loop, posting only newly-found listings.
 - **Deduplication** — listings are upserted into MongoDB keyed on their link, with a separate per-(feed, link) tracking collection so a listing is never reposted to a channel it's already been sent to.
 - **Rich embeds** — each posting includes title, company, location, position type, compensation, a dynamic viewer-local posted time, and the company logo as a thumbnail.

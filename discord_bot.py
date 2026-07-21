@@ -5,8 +5,8 @@ test_scraper.save_new_jobs via a unique Mongo index on `link` plus a
 per-(feed, link) posted-tracking collection).
 
 Requires: pip install discord.py python-dotenv
-Env vars: DISCORD_TOKEN, FEEDS_JSON, MONGO_URI (optional, see test_scraper.py)
-Loaded from a .env file in this directory.
+Env vars: DISCORD_TOKEN, MONGO_URI (optional, see test_scraper.py)
+Loaded from a .env file in this directory. Feeds are configured in feeds.json.
 """
 
 import asyncio
@@ -37,7 +37,7 @@ POLL_MINUTES = 15
 SAVE_EMOJI = "🔖"
 
 if not FEEDS:
-    raise RuntimeError("No feeds configured - set FEEDS_JSON in .env (see test_scraper.py)")
+    raise RuntimeError("No feeds configured - add entries to feeds.json (see test_scraper.py)")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
