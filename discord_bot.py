@@ -12,6 +12,7 @@ Loaded from a .env file in this directory. Feeds are configured in feeds.json.
 import asyncio
 import os
 from datetime import datetime
+from typing import Optional
 
 # Must run before importing test_scraper - its Mongo config constants are read
 # from os.environ at import time, so .env has to be loaded first or they'd
@@ -66,36 +67,43 @@ def job_embed(job: dict) -> discord.Embed:
     return embed
 
 
+async def scrape_and_post(feed: dict) -> int:
+    """Scrape one feed and post any new listings to its channel. Returns the
+    number of listings posted (0 if the channel couldn't be found)."""
+    channel = client.get_channel(int(feed["channel_id"]))
+    if channel is None:
+        # get_channel reads from the gateway cache only - this fires if the bot
+        # was never invited to the server that channel belongs to (or the ID is
+        # wrong), not just if the channel doesn't exist.
+        print(f"[{feed['name']}] channel {feed['channel_id']} not found")
+        return 0
+
+    # scrape_and_store is synchronous (Playwright's sync API + pymongo), so it
+    # would block the whole event loop - including Discord's heartbeat - for
+    # the duration of the scrape. to_thread runs it off the event loop instead.
+    new_jobs = await asyncio.to_thread(scrape_and_store, feed)
+    for job in new_jobs:
+        embed = job_embed(job)
+        if isinstance(channel, discord.ForumChannel):
+            # Forum channels have no .send() - each listing has to become its
+            # own post (thread), which requires a name and a starter message.
+            thread_with_message = await channel.create_thread(
+                name=(job.get("title") or "New job listing")[:100],
+                embed=embed,
+            )
+            message = thread_with_message.message
+        else:
+            message = await channel.send(embed=embed)
+        await message.add_reaction(SAVE_EMOJI)
+    return len(new_jobs)
+
+
 @tasks.loop(minutes=POLL_MINUTES)
 async def poll_jobs():
+    # Feeds are scraped one at a time (not concurrently) to keep at most one
+    # Playwright browser open per poll cycle.
     for feed in FEEDS:
-        channel = client.get_channel(int(feed["channel_id"]))
-        if channel is None:
-            # get_channel reads from the gateway cache only - this fires if the bot
-            # was never invited to the server that channel belongs to (or the ID is
-            # wrong), not just if the channel doesn't exist.
-            print(f"[{feed['name']}] channel {feed['channel_id']} not found")
-            continue
-
-        # scrape_and_store is synchronous (Playwright's sync API + pymongo), so it
-        # would block the whole event loop - including Discord's heartbeat - for
-        # the duration of the scrape. to_thread runs it off the event loop instead.
-        # Feeds are scraped one at a time (not concurrently) to keep at most one
-        # Playwright browser open per poll cycle.
-        new_jobs = await asyncio.to_thread(scrape_and_store, feed)
-        for job in new_jobs:
-            embed = job_embed(job)
-            if isinstance(channel, discord.ForumChannel):
-                # Forum channels have no .send() - each listing has to become its
-                # own post (thread), which requires a name and a starter message.
-                thread_with_message = await channel.create_thread(
-                    name=(job.get("title") or "New job listing")[:100],
-                    embed=embed,
-                )
-                message = thread_with_message.message
-            else:
-                message = await channel.send(embed=embed)
-            await message.add_reaction(SAVE_EMOJI)
+        await scrape_and_post(feed)
 
 
 @tree.command(name="search", description="Search stored job listings by keyword")
@@ -111,6 +119,49 @@ async def search(interaction: discord.Interaction, keyword: str):
         return
 
     await interaction.followup.send(embeds=[job_embed(job) for job in jobs])
+
+
+@tree.command(name="scrape", description="Run a feed scrape right now instead of waiting for the next poll")
+@app_commands.describe(feed="Name of a specific feed to scrape (leave empty to scrape all feeds)")
+async def scrape(interaction: discord.Interaction, feed: Optional[str] = None):
+    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message(
+            "Only the server owner can use this command.", ephemeral=True
+        )
+        return
+
+    if feed is None:
+        targets = FEEDS
+    else:
+        targets = [f for f in FEEDS if f["name"].lower() == feed.lower()]
+        if not targets:
+            names = ", ".join(f["name"] for f in FEEDS)
+            await interaction.response.send_message(
+                f"No feed named '{feed}'. Available feeds: {names}", ephemeral=True
+            )
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Scraped one at a time (not concurrently) to keep at most one Playwright
+    # browser open at a time, same as the periodic poll.
+    results = []
+    for f in targets:
+        count = await scrape_and_post(f)
+        results.append(f"{f['name']}: {count} new")
+
+    await interaction.followup.send("Scrape complete.\n" + "\n".join(results), ephemeral=True)
+
+
+@scrape.autocomplete("feed")
+async def scrape_feed_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return [
+        app_commands.Choice(name=f["name"], value=f["name"])
+        for f in FEEDS
+        if current.lower() in f["name"].lower()
+    ][:25]
 
 
 @tree.command(name="clear_feeds", description="Delete all messages in every feed channel (server owner only)")
