@@ -100,6 +100,12 @@ async def scrape_and_post(feed: dict) -> int:
 
 @tasks.loop(minutes=POLL_MINUTES)
 async def poll_jobs():
+    # tasks.loop runs its body immediately on start() before waiting out the
+    # first interval - skip that iteration so launching the bot doesn't fire
+    # off an unrequested scrape.
+    if poll_jobs.current_loop == 0:
+        return
+
     # Feeds are scraped one at a time (not concurrently) to keep at most one
     # Playwright browser open per poll cycle.
     for feed in FEEDS:
