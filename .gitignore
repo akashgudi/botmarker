@@ -2,4 +2,6 @@
 .claude
 temp.json
 read_temp.mjs
+bot_env
 feeds.json
+__pycache__

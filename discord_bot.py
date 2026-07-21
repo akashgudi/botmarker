@@ -31,7 +31,7 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 # guild-scoped syncs apply immediately, global ones take up to an hour to
 # propagate to Discord clients.
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
-POLL_MINUTES = 15
+POLL_MINUTES = 2
 # Reacting with this emoji on a job listing DMs the reacting user that listing,
 # as a bookmark/save-for-later.
 SAVE_EMOJI = "🔖"
