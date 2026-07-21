@@ -113,6 +113,41 @@ async def search(interaction: discord.Interaction, keyword: str):
     await interaction.followup.send(embeds=[job_embed(job) for job in jobs])
 
 
+@tree.command(name="clear_feeds", description="Delete all messages in every feed channel (server owner only)")
+async def clear_feeds(interaction: discord.Interaction):
+    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message(
+            "Only the server owner can use this command.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    cleared = []
+    for feed in FEEDS:
+        channel = client.get_channel(int(feed["channel_id"]))
+        if channel is None:
+            print(f"[{feed['name']}] channel {feed['channel_id']} not found")
+            continue
+
+        if isinstance(channel, discord.ForumChannel):
+            # Forum channel content lives in threads (posts), not top-level
+            # messages, so clearing it means deleting the threads themselves -
+            # both active and archived, since purge() only affects normal channels.
+            for thread in channel.threads:
+                await thread.delete()
+            async for thread in channel.archived_threads(limit=None):
+                await thread.delete()
+        else:
+            await channel.purge(limit=None)
+        cleared.append(feed["name"])
+
+    await interaction.followup.send(
+        f"Cleared {len(cleared)} feed channel(s): {', '.join(cleared) if cleared else 'none'}.",
+        ephemeral=True,
+    )
+
+
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # Raw (not cached-message) event, so this fires even for listings sent before
