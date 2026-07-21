@@ -109,16 +109,16 @@ async def poll_jobs():
 @tree.command(name="search", description="Search stored job listings by keyword")
 @app_commands.describe(keyword="Word or phrase to match against title/company/location/type")
 async def search(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
     # search_jobs hits Mongo synchronously - to_thread keeps it off the event loop.
     jobs = await asyncio.to_thread(search_jobs, keyword, 5)
 
     if not jobs:
-        await interaction.followup.send(f"No jobs found matching '{keyword}'.")
+        await interaction.followup.send(f"No jobs found matching '{keyword}'.", ephemeral=True)
         return
 
-    await interaction.followup.send(embeds=[job_embed(job) for job in jobs])
+    await interaction.followup.send(embeds=[job_embed(job) for job in jobs], ephemeral=True)
 
 
 @tree.command(name="scrape", description="Run a feed scrape right now instead of waiting for the next poll")
