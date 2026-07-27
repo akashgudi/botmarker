@@ -55,6 +55,23 @@ def migrate():
     feeds_collection = get_feeds_collection()
 
     try:
+        # The OLD (feed, link) unique index is still live on this collection
+        # (it predates this migration) and MUST be dropped before any
+        # conversions below - otherwise it actively enforces uniqueness on
+        # `feed` while we're $unsetting it, and the same shared-link collision
+        # described above hits every write, not just a hypothetical rebuild.
+        old_index_name = next(
+            (
+                name
+                for name, info in posted.index_information().items()
+                if info.get("key") == [("feed", 1), ("link", 1)]
+            ),
+            None,
+        )
+        if old_index_name:
+            posted.drop_index(old_index_name)
+            print(f"Dropped stale index '{old_index_name}' on posted_jobs.\n")
+
         for old_feed in old_feeds:
             name, url, channel_id = old_feed["name"], old_feed["url"], old_feed["channel_id"]
 
