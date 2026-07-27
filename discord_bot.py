@@ -45,6 +45,27 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
+async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True) -> bool:
+    """Acknowledge an interaction, returning False (and doing nothing else) if
+    it's already been acknowledged.
+
+    Discord's gateway can rarely redeliver the same interaction (e.g. after a
+    reconnect/session resume), spawning a second concurrent task for it - the
+    first task to call defer()/send_message() wins, and the second's call
+    raises HTTPException 40060 rather than silently no-opping. Callers should
+    treat a False return as "another task already handled this" and return
+    immediately instead of continuing.
+    """
+    try:
+        await interaction.response.defer(ephemeral=ephemeral)
+        return True
+    except discord.HTTPException as e:
+        if e.code != 40060:
+            raise
+        print(f"Interaction {interaction.id} was already acknowledged elsewhere - skipping duplicate dispatch.")
+        return False
+
+
 def job_embed(job: dict) -> discord.Embed:
     embed = discord.Embed(title=job.get("title") or "New job listing", url=job["link"])
     if job.get("company"):
@@ -118,7 +139,8 @@ async def poll_jobs():
 @app_commands.describe(keyword="Word or phrase to match against title/company/location/type")
 @app_commands.guild_only()
 async def search(interaction: discord.Interaction, keyword: str):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
 
     # search_jobs hits Mongo synchronously - to_thread keeps it off the event loop.
     # Scoped to this guild's own feeds, not every server's scraped content.
@@ -145,7 +167,8 @@ async def add_feed_cmd(
     url: str,
     channel: Union[discord.TextChannel, discord.ForumChannel],
 ):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
 
     try:
         await asyncio.to_thread(
@@ -163,7 +186,8 @@ async def add_feed_cmd(
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def remove_feed_cmd(interaction: discord.Interaction, name: str):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
 
     removed = await asyncio.to_thread(remove_feed, interaction.guild_id, name)
     if removed:
@@ -190,7 +214,8 @@ async def remove_feed_autocomplete(
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def list_feeds_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
 
     feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
     if not feeds:
@@ -216,12 +241,18 @@ async def scrape(interaction: discord.Interaction, feed: Optional[str] = None):
         targets = [f for f in guild_feeds if f["name"].lower() == feed.lower()]
         if not targets:
             names = ", ".join(f["name"] for f in guild_feeds) or "none configured"
-            await interaction.response.send_message(
-                f"No feed named '{feed}'. Available feeds: {names}", ephemeral=True
-            )
+            try:
+                await interaction.response.send_message(
+                    f"No feed named '{feed}'. Available feeds: {names}", ephemeral=True
+                )
+            except discord.HTTPException as e:
+                if e.code != 40060:
+                    raise
+                print(f"Interaction {interaction.id} was already acknowledged elsewhere - skipping duplicate dispatch.")
             return
 
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
 
     # Scraped one at a time (not concurrently) to keep at most one Playwright
     # browser open at a time, same as the periodic poll.
@@ -254,7 +285,8 @@ async def scrape_feed_autocomplete(
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def clear_feeds(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+    if not await safe_defer(interaction):
+        return
 
     feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
     cleared = []
@@ -292,10 +324,15 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         print(f"Unhandled app command error: {error}")
         message = "Something went wrong running that command."
 
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException as e:
+        if e.code != 40060:
+            raise
+        print(f"Interaction {interaction.id} was already acknowledged elsewhere - skipping error reply.")
 
 
 @client.event
