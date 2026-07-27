@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
@@ -317,6 +317,86 @@ def get_feed(guild_id: str, name: str, collection=None) -> dict | None:
     finally:
         if owns_client:
             collection.database.client.close()
+
+
+def edit_feed(
+    guild_id: str,
+    name: str,
+    *,
+    new_name: str | None = None,
+    url: str | None = None,
+    channel_id: str | None = None,
+    collection=None,
+) -> dict:
+    """Update an existing feed's name/url/channel in place - same `_id`, so its
+    posted_jobs dedup history (keyed by feed_id) survives the edit, unlike
+    remove_feed + add_feed which would start that history over from scratch.
+
+    Raises ValueError if no feed named `name` exists in this guild, if no
+    fields were given to update, or if `new_name` collides with a different
+    feed already in this guild.
+    """
+    owns_client = collection is None
+    if owns_client:
+        collection = get_feeds_collection()
+
+    try:
+        guild_id = str(guild_id)
+        updates = {}
+        if new_name is not None:
+            updates["name"] = new_name
+            updates["name_key"] = new_name.strip().lower()
+        if url is not None:
+            updates["url"] = url
+        if channel_id is not None:
+            updates["channel_id"] = str(channel_id)
+
+        if not updates:
+            raise ValueError("Nothing to update - provide at least one of new_name, url, or channel")
+
+        try:
+            feed = collection.find_one_and_update(
+                {"guild_id": guild_id, "name_key": name.strip().lower()},
+                {"$set": updates},
+                return_document=ReturnDocument.AFTER,
+            )
+        except DuplicateKeyError:
+            raise ValueError(f"A feed named '{new_name}' already exists in this server")
+
+        if feed is None:
+            raise ValueError(f"No feed named '{name}' found")
+        return feed
+    finally:
+        if owns_client:
+            collection.database.client.close()
+
+
+def reset_feed(guild_id: str, name: str, feeds_collection=None, posted_collection=None) -> int:
+    """Clear one feed's dedup history (not the feed itself), so its next
+    scrape reports every currently-matching listing as new again. Returns how
+    many posted-job records were cleared.
+
+    Raises ValueError if no feed named `name` exists in this guild.
+    """
+    owns_feeds = feeds_collection is None
+    owns_posted = posted_collection is None
+    if owns_feeds:
+        feeds_collection = get_feeds_collection()
+    if owns_posted:
+        posted_collection = get_posted_collection()
+
+    try:
+        feed = get_feed(guild_id, name, collection=feeds_collection)
+        if feed is None:
+            raise ValueError(f"No feed named '{name}' found")
+
+        result = posted_collection.delete_many({"guild_id": str(guild_id), "feed_id": feed["_id"]})
+        return result.deleted_count
+    finally:
+        if owns_feeds:
+            feeds_collection.database.client.close()
+        if owns_posted:
+            posted_collection.database.client.close()
 
 
 def save_new_jobs(

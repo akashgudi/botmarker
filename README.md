@@ -33,7 +33,18 @@ Scrapes job listings from [hitmarker.net](https://hitmarker.net) and posts new o
    ```
    /add_feed name:Internships url:https://hitmarker.net/jobs?... channel:#internships
    ```
-   Requires the **Manage Server** permission. Each server manages its own feeds; the same feed name can be reused across different servers. `/list_feeds` shows what's configured and `/remove_feed` deletes one.
+   Requires the **Manage Server** permission. Each server manages its own feeds; the same feed name can be reused across different servers.
+
+   | Command | Purpose |
+   |---|---|
+   | `/list_feeds` | Show this server's configured feeds |
+   | `/edit_feed` | Update a feed's name/URL/channel in place, without losing its dedup history |
+   | `/remove_feed` | Delete a feed entirely (asks for confirmation) |
+   | `/reset_feed` | Clear one feed's dedup history so its next scrape reposts everything currently matching (asks for confirmation) |
+   | `/clear_feed` | Delete all messages/threads in one feed's channel (asks for confirmation) |
+   | `/clear_feeds` | Delete all messages/threads across every feed's channel (asks for confirmation) |
+   | `/scrape` | Run a scrape immediately instead of waiting for the next poll |
+   | `/search` | Search this server's own posted job listings by keyword |
 
 ## Running
 
@@ -67,12 +78,13 @@ Older versions of this bot configured feeds via a `feeds.json` file for one hard
 
 ## Features
 
-- **Multi-server, self-serve** — invite the bot to any number of servers; each configures its own feeds via `/add_feed`/`/remove_feed`/`/list_feeds` (Manage Server permission required), with feed names, dedup state, and search results all scoped per server.
+- **Multi-server, self-serve** — invite the bot to any number of servers; each configures its own feeds via slash commands (Manage Server permission required), with feed names, dedup state, and search results all scoped per server.
+- **Full feed management** — `/add_feed`, `/edit_feed` (update name/URL/channel without losing dedup history), `/remove_feed`, and `/list_feeds` cover the feed lifecycle; destructive commands (`/remove_feed`, `/reset_feed`, `/clear_feed`, `/clear_feeds`) ask for confirmation via buttons before doing anything.
 - **Multi-feed scraping** — configure any number of (search URL, channel) pairs per server; each feed is scraped and posted independently, and listings matching multiple feeds' filters are posted to every matching channel.
 - **Automatic polling** — scrapes every `POLL_MINUTES` on a background loop, posting only newly-found listings; `/scrape` runs a server's feeds immediately instead of waiting.
-- **Deduplication** — listings are upserted into MongoDB keyed on their link, with a separate per-(server, feed, link) tracking collection so a listing is never reposted to a channel it's already been sent to.
+- **Deduplication** — listings are upserted into MongoDB keyed on their link, with a separate per-(server, feed, link) tracking collection so a listing is never reposted to a channel it's already been sent to; `/reset_feed` clears one feed's dedup history on demand.
 - **Rich embeds** — each posting includes title, company, location, position type, compensation, a dynamic viewer-local posted time, and the company logo as a thumbnail.
-- **Forum channel support** — if a feed's target channel is a Discord forum, each listing is posted as its own thread instead of a plain message; `/clear_feeds` (Manage Server permission required) clears a server's feed channels, deleting threads for forum channels.
+- **Forum channel support** — if a feed's target channel is a Discord forum, each listing is posted as its own thread instead of a plain message; `/clear_feed`/`/clear_feeds` clear a server's feed channel(s), deleting threads for forum channels.
 - **Save-for-later via reaction** — reacting 🔖 on a listing DMs that listing's embed to the reacting user, and works even on listings posted before the bot's current process started.
 - **`/search` slash command** — search a server's own posted job listings by keyword against title/company/location/type and get the top matches back as embeds.
 - **Instant onboarding** — joining a new server immediately syncs slash commands there (rather than waiting on global propagation) and posts a welcome message explaining `/add_feed`.

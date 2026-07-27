@@ -1,10 +1,11 @@
 """
 Discord bot that can be invited to any number of servers. Each server manages
-its own feeds via /add_feed, /remove_feed, and /list_feeds; periodically it
-scrapes every server's configured feeds and posts only the listings not
-already posted to that feed's channel (dedup is handled in
-test_scraper.save_new_jobs via a unique Mongo index on `link` plus a
-per-(guild, feed, link) posted-tracking collection).
+its own feeds via /add_feed, /edit_feed, /remove_feed, and /list_feeds (plus
+/clear_feed(s) and /reset_feed for cleanup); periodically it scrapes every
+server's configured feeds and posts only the listings not already posted to
+that feed's channel (dedup is handled in test_scraper.save_new_jobs via a
+unique Mongo index on `link` plus a per-(guild, feed, link) posted-tracking
+collection).
 
 Requires: pip install discord.py python-dotenv
 Env vars: DISCORD_TOKEN, MONGO_URI (optional, see test_scraper.py)
@@ -27,7 +28,16 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from test_scraper import add_feed, list_feeds, remove_feed, scrape_and_store, search_jobs
+from test_scraper import (
+    add_feed,
+    edit_feed,
+    get_feed,
+    list_feeds,
+    remove_feed,
+    reset_feed,
+    scrape_and_store,
+    search_jobs,
+)
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 # Optional dev convenience: a guild ID to additionally sync commands to
@@ -64,6 +74,68 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True
             raise
         print(f"Interaction {interaction.id} was already acknowledged elsewhere - skipping duplicate dispatch.")
         return False
+
+
+class ConfirmView(discord.ui.View):
+    """Two-button (Confirm/Cancel) prompt restricted to whoever ran the command."""
+
+    def __init__(self, invoker_id: int):
+        super().__init__(timeout=30)
+        self.invoker_id = invoker_id
+        self.confirmed: Optional[bool] = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "Only the person who ran this command can respond to it.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        await interaction.response.edit_message(content="Confirmed - running...", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+
+async def confirm_action(interaction: discord.Interaction, prompt: str) -> bool:
+    """Ask the invoking user to confirm a destructive action via buttons before
+    proceeding. Must be called after the interaction has already been
+    acknowledged (e.g. via safe_defer)."""
+    view = ConfirmView(interaction.user.id)
+    message = await interaction.followup.send(prompt, view=view, ephemeral=True)
+    await view.wait()
+
+    if view.confirmed is None:
+        try:
+            await message.edit(content="Confirmation timed out - nothing was done.", view=None)
+        except discord.HTTPException:
+            pass
+        return False
+
+    return view.confirmed
+
+
+async def feed_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Shared autocomplete for any command whose only relevant string option is
+    an existing feed's name in the invoking guild."""
+    if interaction.guild_id is None:
+        return []
+    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
+    return [
+        app_commands.Choice(name=f["name"], value=f["name"])
+        for f in feeds
+        if current.lower() in f["name"].lower()
+    ][:25]
 
 
 def job_embed(job: dict) -> discord.Embed:
@@ -117,6 +189,25 @@ async def scrape_and_post(feed: dict) -> int:
             message = await channel.send(embed=embed)
         await message.add_reaction(SAVE_EMOJI)
     return len(new_jobs)
+
+
+async def clear_feed_channel(feed: dict) -> bool:
+    """Clear one feed's channel - purge messages, or delete every thread (post)
+    for a forum channel, since purge() only works on regular text channels.
+    Returns whether the channel was found and cleared."""
+    channel = client.get_channel(int(feed["channel_id"]))
+    if channel is None:
+        print(f"[{feed['name']}] channel {feed['channel_id']} not found")
+        return False
+
+    if isinstance(channel, discord.ForumChannel):
+        for thread in channel.threads:
+            await thread.delete()
+        async for thread in channel.archived_threads(limit=None):
+            await thread.delete()
+    else:
+        await channel.purge(limit=None)
+    return True
 
 
 @tasks.loop(minutes=POLL_MINUTES)
@@ -189,6 +280,13 @@ async def remove_feed_cmd(interaction: discord.Interaction, name: str):
     if not await safe_defer(interaction):
         return
 
+    if not await confirm_action(
+        interaction,
+        f"Remove feed '{name}'? This deletes its configuration and dedup history "
+        "and cannot be undone - to just change its URL/channel/name instead, use /edit_feed.",
+    ):
+        return
+
     removed = await asyncio.to_thread(remove_feed, interaction.guild_id, name)
     if removed:
         await interaction.followup.send(f"Removed feed '{name}'.", ephemeral=True)
@@ -196,18 +294,47 @@ async def remove_feed_cmd(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"No feed named '{name}' found.", ephemeral=True)
 
 
-@remove_feed_cmd.autocomplete("name")
-async def remove_feed_autocomplete(
-    interaction: discord.Interaction, current: str
-) -> list[app_commands.Choice[str]]:
-    if interaction.guild_id is None:
-        return []
-    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
-    return [
-        app_commands.Choice(name=f["name"], value=f["name"])
-        for f in feeds
-        if current.lower() in f["name"].lower()
-    ][:25]
+remove_feed_cmd.autocomplete("name")(feed_name_autocomplete)
+
+
+@tree.command(name="edit_feed", description="Update an existing feed's name, URL, or channel (Manage Server permission required)")
+@app_commands.describe(
+    name="Current name of the feed to edit",
+    new_name="New name for the feed (leave blank to keep it)",
+    url="New hitmarker.net search URL (leave blank to keep it)",
+    channel="New channel/forum to post to (leave blank to keep it)",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def edit_feed_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    new_name: Optional[str] = None,
+    url: Optional[str] = None,
+    channel: Optional[Union[discord.TextChannel, discord.ForumChannel]] = None,
+):
+    if not await safe_defer(interaction):
+        return
+
+    try:
+        feed = await asyncio.to_thread(
+            edit_feed,
+            interaction.guild_id,
+            name,
+            new_name=new_name,
+            url=url,
+            channel_id=str(channel.id) if channel else None,
+        )
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"Updated feed '{feed['name']}' -> <#{feed['channel_id']}>.", ephemeral=True
+    )
+
+
+edit_feed_cmd.autocomplete("name")(feed_name_autocomplete)
 
 
 @tree.command(name="list_feeds", description="List this server's configured feeds (Manage Server permission required)")
@@ -267,18 +394,7 @@ async def scrape(interaction: discord.Interaction, feed: Optional[str] = None):
     )
 
 
-@scrape.autocomplete("feed")
-async def scrape_feed_autocomplete(
-    interaction: discord.Interaction, current: str
-) -> list[app_commands.Choice[str]]:
-    if interaction.guild_id is None:
-        return []
-    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
-    return [
-        app_commands.Choice(name=f["name"], value=f["name"])
-        for f in feeds
-        if current.lower() in f["name"].lower()
-    ][:25]
+scrape.autocomplete("feed")(feed_name_autocomplete)
 
 
 @tree.command(name="clear_feeds", description="Delete all messages in every feed channel (Manage Server permission required)")
@@ -289,29 +405,84 @@ async def clear_feeds(interaction: discord.Interaction):
         return
 
     feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
-    cleared = []
-    for feed in feeds:
-        channel = client.get_channel(int(feed["channel_id"]))
-        if channel is None:
-            print(f"[{feed['name']}] channel {feed['channel_id']} not found")
-            continue
+    if not feeds:
+        await interaction.followup.send("No feeds configured for this server.", ephemeral=True)
+        return
 
-        if isinstance(channel, discord.ForumChannel):
-            # Forum channel content lives in threads (posts), not top-level
-            # messages, so clearing it means deleting the threads themselves -
-            # both active and archived, since purge() only affects normal channels.
-            for thread in channel.threads:
-                await thread.delete()
-            async for thread in channel.archived_threads(limit=None):
-                await thread.delete()
-        else:
-            await channel.purge(limit=None)
-        cleared.append(feed["name"])
+    if not await confirm_action(
+        interaction,
+        f"Clear all {len(feeds)} feed channel(s) for this server? This deletes messages/threads "
+        "and cannot be undone - to clear just one feed's channel instead, use /clear_feed.",
+    ):
+        return
 
+    cleared = [feed["name"] for feed in feeds if await clear_feed_channel(feed)]
     await interaction.followup.send(
         f"Cleared {len(cleared)} feed channel(s): {', '.join(cleared) if cleared else 'none'}.",
         ephemeral=True,
     )
+
+
+@tree.command(name="clear_feed", description="Delete all messages in one feed's channel (Manage Server permission required)")
+@app_commands.describe(name="Name of the feed whose channel should be cleared")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def clear_feed_cmd(interaction: discord.Interaction, name: str):
+    if not await safe_defer(interaction):
+        return
+
+    feed = await asyncio.to_thread(get_feed, interaction.guild_id, name)
+    if feed is None:
+        await interaction.followup.send(f"No feed named '{name}' found.", ephemeral=True)
+        return
+
+    if not await confirm_action(
+        interaction,
+        f"Clear the channel for feed '{feed['name']}'? This deletes messages/threads and cannot be undone.",
+    ):
+        return
+
+    if await clear_feed_channel(feed):
+        await interaction.followup.send(f"Cleared the channel for feed '{feed['name']}'.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            f"Could not find the channel for feed '{feed['name']}'.", ephemeral=True
+        )
+
+
+clear_feed_cmd.autocomplete("name")(feed_name_autocomplete)
+
+
+@tree.command(
+    name="reset_feed",
+    description="Clear one feed's dedup history so its next scrape reposts everything currently matching (Manage Server permission required)",
+)
+@app_commands.describe(name="Name of the feed to reset")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def reset_feed_cmd(interaction: discord.Interaction, name: str):
+    if not await safe_defer(interaction):
+        return
+
+    if not await confirm_action(
+        interaction,
+        f"Reset the dedup history for feed '{name}'? Its next scrape will repost every "
+        "currently-matching listing as if it were new.",
+    ):
+        return
+
+    try:
+        count = await asyncio.to_thread(reset_feed, interaction.guild_id, name)
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"Cleared {count} record(s) from the dedup history for feed '{name}'.", ephemeral=True
+    )
+
+
+reset_feed_cmd.autocomplete("name")(feed_name_autocomplete)
 
 
 @tree.error
@@ -380,9 +551,11 @@ async def on_guild_join(guild: discord.Guild):
         await channel.send(
             "Thanks for adding me! Use `/add_feed` (requires the Manage Server "
             f"permission) to configure a job feed - I'll scrape it every {POLL_MINUTES} "
-            "minutes and post new listings to the channel you choose. `/list_feeds` "
-            "shows what's configured, `/remove_feed` deletes one, and `/scrape` runs "
-            "a feed immediately instead of waiting for the next poll."
+            "minutes and post new listings to the channel you choose. `/list_feeds` shows "
+            "what's configured, `/edit_feed` updates one without losing its history, "
+            "`/remove_feed` deletes one, `/reset_feed` clears a feed's dedup history, "
+            "`/clear_feed(s)` clears posted messages, and `/scrape` runs a feed "
+            "immediately instead of waiting for the next poll."
         )
     except discord.Forbidden:
         pass
