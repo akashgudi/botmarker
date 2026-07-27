@@ -455,7 +455,7 @@ clear_feed_cmd.autocomplete("name")(feed_name_autocomplete)
 
 @tree.command(
     name="reset_feed",
-    description="Clear one feed's dedup history so its next scrape reposts everything currently matching (Manage Server permission required)",
+    description="Clear a feed's dedup history so it reposts everything on its next scrape (Manage Server)",
 )
 @app_commands.describe(name="Name of the feed to reset")
 @app_commands.checks.has_permissions(manage_guild=True)
