@@ -1,18 +1,20 @@
 """
-Discord bot that periodically scrapes each configured feed and posts only the
-listings not already posted to that feed's channel (dedup is handled in
+Discord bot that can be invited to any number of servers. Each server manages
+its own feeds via /add_feed, /remove_feed, and /list_feeds; periodically it
+scrapes every server's configured feeds and posts only the listings not
+already posted to that feed's channel (dedup is handled in
 test_scraper.save_new_jobs via a unique Mongo index on `link` plus a
-per-(feed, link) posted-tracking collection).
+per-(guild, feed, link) posted-tracking collection).
 
 Requires: pip install discord.py python-dotenv
 Env vars: DISCORD_TOKEN, MONGO_URI (optional, see test_scraper.py)
-Loaded from a .env file in this directory. Feeds are configured in feeds.json.
+Loaded from a .env file in this directory.
 """
 
 import asyncio
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 # Must run before importing test_scraper - its Mongo config constants are read
 # from os.environ at import time, so .env has to be loaded first or they'd
@@ -25,20 +27,18 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from test_scraper import FEEDS, scrape_and_store, search_jobs
+from test_scraper import add_feed, list_feeds, remove_feed, scrape_and_store, search_jobs
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-# Optional: set this to a guild ID for instant command sync while testing -
-# guild-scoped syncs apply immediately, global ones take up to an hour to
-# propagate to Discord clients.
+# Optional dev convenience: a guild ID to additionally sync commands to
+# instantly (guild-scoped syncs apply immediately, unlike the global sync in
+# on_ready, which can take up to an hour to propagate to Discord clients).
+# Not required - new servers get instant sync automatically via on_guild_join.
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 POLL_MINUTES = 60
 # Reacting with this emoji on a job listing DMs the reacting user that listing,
 # as a bookmark/save-for-later.
 SAVE_EMOJI = "🔖"
-
-if not FEEDS:
-    raise RuntimeError("No feeds configured - add entries to feeds.json (see test_scraper.py)")
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -106,19 +106,23 @@ async def poll_jobs():
     if poll_jobs.current_loop == 0:
         return
 
-    # Feeds are scraped one at a time (not concurrently) to keep at most one
-    # Playwright browser open per poll cycle.
-    for feed in FEEDS:
-        await scrape_and_post(feed)
+    # Feeds are scraped one at a time (not concurrently, across every guild the
+    # bot is in) to keep at most one Playwright browser open per poll cycle.
+    for guild in client.guilds:
+        feeds = await asyncio.to_thread(list_feeds, guild.id)
+        for feed in feeds:
+            await scrape_and_post(feed)
 
 
-@tree.command(name="search", description="Search stored job listings by keyword")
+@tree.command(name="search", description="Search this server's job listings by keyword")
 @app_commands.describe(keyword="Word or phrase to match against title/company/location/type")
+@app_commands.guild_only()
 async def search(interaction: discord.Interaction, keyword: str):
     await interaction.response.defer(ephemeral=True)
 
     # search_jobs hits Mongo synchronously - to_thread keeps it off the event loop.
-    jobs = await asyncio.to_thread(search_jobs, keyword, 5)
+    # Scoped to this guild's own feeds, not every server's scraped content.
+    jobs = await asyncio.to_thread(search_jobs, keyword, interaction.guild_id, 5)
 
     if not jobs:
         await interaction.followup.send(f"No jobs found matching '{keyword}'.", ephemeral=True)
@@ -127,21 +131,91 @@ async def search(interaction: discord.Interaction, keyword: str):
     await interaction.followup.send(embeds=[job_embed(job) for job in jobs], ephemeral=True)
 
 
-@tree.command(name="scrape", description="Run a feed scrape right now instead of waiting for the next poll")
-@app_commands.describe(feed="Name of a specific feed to scrape (leave empty to scrape all feeds)")
-async def scrape(interaction: discord.Interaction, feed: Optional[str] = None):
-    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message(
-            "Only the server owner can use this command.", ephemeral=True
+@tree.command(name="add_feed", description="Add a job feed for this server (Manage Server permission required)")
+@app_commands.describe(
+    name="Short name for this feed (must be unique in this server)",
+    url="A hitmarker.net search-results URL with your filters already applied",
+    channel="Channel (or forum) new listings for this feed should be posted to",
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def add_feed_cmd(
+    interaction: discord.Interaction,
+    name: str,
+    url: str,
+    channel: Union[discord.TextChannel, discord.ForumChannel],
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await asyncio.to_thread(
+            add_feed, interaction.guild_id, name, url, channel.id, str(interaction.user.id)
+        )
+    except ValueError as e:
+        await interaction.followup.send(str(e), ephemeral=True)
+        return
+
+    await interaction.followup.send(f"Added feed '{name}' -> {channel.mention}.", ephemeral=True)
+
+
+@tree.command(name="remove_feed", description="Remove one of this server's feeds (Manage Server permission required)")
+@app_commands.describe(name="Name of the feed to remove")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def remove_feed_cmd(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    removed = await asyncio.to_thread(remove_feed, interaction.guild_id, name)
+    if removed:
+        await interaction.followup.send(f"Removed feed '{name}'.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"No feed named '{name}' found.", ephemeral=True)
+
+
+@remove_feed_cmd.autocomplete("name")
+async def remove_feed_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None:
+        return []
+    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
+    return [
+        app_commands.Choice(name=f["name"], value=f["name"])
+        for f in feeds
+        if current.lower() in f["name"].lower()
+    ][:25]
+
+
+@tree.command(name="list_feeds", description="List this server's configured feeds (Manage Server permission required)")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def list_feeds_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
+    if not feeds:
+        await interaction.followup.send(
+            "No feeds configured yet - use /add_feed to add one.", ephemeral=True
         )
         return
 
+    lines = [f"**{f['name']}** -> <#{f['channel_id']}>\n{f['url']}" for f in feeds]
+    await interaction.followup.send("\n\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="scrape", description="Run a feed scrape right now instead of waiting for the next poll")
+@app_commands.describe(feed="Name of a specific feed to scrape (leave empty to scrape all feeds)")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def scrape(interaction: discord.Interaction, feed: Optional[str] = None):
+    guild_feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
+
     if feed is None:
-        targets = FEEDS
+        targets = guild_feeds
     else:
-        targets = [f for f in FEEDS if f["name"].lower() == feed.lower()]
+        targets = [f for f in guild_feeds if f["name"].lower() == feed.lower()]
         if not targets:
-            names = ", ".join(f["name"] for f in FEEDS)
+            names = ", ".join(f["name"] for f in guild_feeds) or "none configured"
             await interaction.response.send_message(
                 f"No feed named '{feed}'. Available feeds: {names}", ephemeral=True
             )
@@ -156,32 +230,35 @@ async def scrape(interaction: discord.Interaction, feed: Optional[str] = None):
         count = await scrape_and_post(f)
         results.append(f"{f['name']}: {count} new")
 
-    await interaction.followup.send("Scrape complete.\n" + "\n".join(results), ephemeral=True)
+    await interaction.followup.send(
+        "Scrape complete.\n" + "\n".join(results) if results else "No feeds configured for this server.",
+        ephemeral=True,
+    )
 
 
 @scrape.autocomplete("feed")
 async def scrape_feed_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id is None:
+        return []
+    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
     return [
         app_commands.Choice(name=f["name"], value=f["name"])
-        for f in FEEDS
+        for f in feeds
         if current.lower() in f["name"].lower()
     ][:25]
 
 
-@tree.command(name="clear_feeds", description="Delete all messages in every feed channel (server owner only)")
+@tree.command(name="clear_feeds", description="Delete all messages in every feed channel (Manage Server permission required)")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
 async def clear_feeds(interaction: discord.Interaction):
-    if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message(
-            "Only the server owner can use this command.", ephemeral=True
-        )
-        return
-
     await interaction.response.defer(ephemeral=True)
 
+    feeds = await asyncio.to_thread(list_feeds, interaction.guild_id)
     cleared = []
-    for feed in FEEDS:
+    for feed in feeds:
         channel = client.get_channel(int(feed["channel_id"]))
         if channel is None:
             print(f"[{feed['name']}] channel {feed['channel_id']} not found")
@@ -203,6 +280,22 @@ async def clear_feeds(interaction: discord.Interaction):
         f"Cleared {len(cleared)} feed channel(s): {', '.join(cleared) if cleared else 'none'}.",
         ephemeral=True,
     )
+
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the Manage Server permission to use this command."
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        message = "This command can only be used in a server."
+    else:
+        print(f"Unhandled app command error: {error}")
+        message = "Something went wrong running that command."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @client.event
@@ -230,15 +323,45 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 
 @client.event
+async def on_guild_join(guild: discord.Guild):
+    # Guild-scoped sync applies instantly, unlike the global sync in on_ready
+    # (which can take up to an hour to reach Discord clients) - without this, a
+    # newly-invited server would see no slash commands for a while.
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
+
+    channel = guild.system_channel
+    if channel is None or not channel.permissions_for(guild.me).send_messages:
+        channel = next(
+            (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages),
+            None,
+        )
+    if channel is None:
+        return
+
+    try:
+        await channel.send(
+            "Thanks for adding me! Use `/add_feed` (requires the Manage Server "
+            f"permission) to configure a job feed - I'll scrape it every {POLL_MINUTES} "
+            "minutes and post new listings to the channel you choose. `/list_feeds` "
+            "shows what's configured, `/remove_feed` deletes one, and `/scrape` runs "
+            "a feed immediately instead of waiting for the next poll."
+        )
+    except discord.Forbidden:
+        pass
+
+
+@client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
 
+    await tree.sync()
+
     if DISCORD_GUILD_ID:
+        # Optional dev convenience for instant local sync - see DISCORD_GUILD_ID above.
         guild = discord.Object(id=int(DISCORD_GUILD_ID))
         tree.copy_global_to(guild=guild)
         await tree.sync(guild=guild)
-    else:
-        await tree.sync()
 
     if not poll_jobs.is_running():
         poll_jobs.start()

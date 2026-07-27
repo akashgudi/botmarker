@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -18,23 +19,20 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from pymongo import MongoClient, UpdateOne
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
 # ---- Configuration ----------------------------------------------------
 # Each feed is an independent hitmarker.net search-results URL (its filters baked
 # into the query string) that gets posted to its own Discord channel - see
-# discord_bot.py's poll_jobs. Configured as a JSON array in FEEDS_FILE, e.g.:
-#   [{"name": "US Internships", "url": "https://hitmarker.net/jobs?...", "channel_id": "123..."}]
-# test_scraper.py itself only reads name/url; channel_id is carried through for
-# discord_bot.py to use.
-FEEDS_FILE = os.environ.get("FEEDS_FILE", "feeds.json")
-if os.path.exists(FEEDS_FILE):
-    with open(FEEDS_FILE, encoding="utf-8") as f:
-        FEEDS: list[dict] = json.load(f)
-else:
-    FEEDS = []
+# discord_bot.py's poll_jobs. Feeds are per-guild and stored in Mongo (see the
+# feeds collection helpers below) rather than a shared config file, so each
+# invited server manages its own feeds via discord_bot.py's slash commands.
+MAX_FEEDS_PER_GUILD = 15               # poll_jobs scrapes every guild's feeds
+                                        # sequentially, one browser at a time -
+                                        # this caps how much one server can add
+                                        # to everyone else's poll cycle time.
 NUM_PAGES = 3                         # click through pages 1..NUM_PAGES of results, per feed
 JOBS_PATH_PREFIX = "/jobs/"          # matches url.com/jobs/<anything>
 OUTPUT_FILE = "jobs.json"
@@ -46,11 +44,16 @@ USER_AGENT = "Mozilla/5.0 (compatible; JobLinkScraper/1.0)"
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.environ.get("MONGO_DB", "job_scraper")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "jobs")
-# Tracks which (feed, link) pairs have already been reported as new, separately
-# from `jobs` - so a listing matching more than one feed's filters still gets
-# surfaced to each matching feed's channel, even though its content (in `jobs`)
-# is only stored once.
+# Tracks which (guild, feed, link) tuples have already been reported as new,
+# separately from `jobs` - so a listing matching more than one feed's filters
+# still gets surfaced to each matching feed's channel, even though its content
+# (in `jobs`) is only stored once. Scoped by guild (not just feed) so two
+# different servers naming a feed the same thing don't share dedup state.
 POSTED_COLLECTION = os.environ.get("MONGO_POSTED_COLLECTION", "posted_jobs")
+# Per-guild feed configuration (name/url/channel), replacing the old
+# feeds.json - each invited Discord server manages its own feeds through
+# discord_bot.py's slash commands rather than editing a shared file.
+FEEDS_COLLECTION = os.environ.get("MONGO_FEEDS_COLLECTION", "feeds")
 
 # CSS path to the job list container, copied from the rendered DOM (hitmarker.net
 # is a client-rendered SPA, so this is Tailwind's generated classes, not
@@ -214,26 +217,123 @@ def get_jobs_collection():
 
 
 def get_posted_collection():
-    """Connect and make sure (feed, link) is unique, so a feed can't double-post a link."""
+    """Connect and make sure (guild, feed, link) is unique, so a feed can't double-post a link."""
     client = MongoClient(MONGO_URI)
     collection = client[MONGO_DB][POSTED_COLLECTION]
-    collection.create_index([("feed", 1), ("link", 1)], unique=True)
+    collection.create_index([("guild_id", 1), ("feed_id", 1), ("link", 1)], unique=True)
     return collection
+
+
+def get_feeds_collection():
+    """Connect and make sure feed names are unique per guild (not globally),
+    so two different servers can each have their own feed named e.g. 'Marketing'."""
+    client = MongoClient(MONGO_URI)
+    collection = client[MONGO_DB][FEEDS_COLLECTION]
+    collection.create_index([("guild_id", 1), ("name_key", 1)], unique=True)
+    return collection
+
+
+def add_feed(
+    guild_id: str,
+    name: str,
+    url: str,
+    channel_id: str,
+    created_by: str | None = None,
+    collection=None,
+) -> dict:
+    """Create a feed for one guild.
+
+    Raises ValueError if the guild already has MAX_FEEDS_PER_GUILD feeds, or if
+    a feed with that name (case-insensitive) already exists in this guild.
+    """
+    owns_client = collection is None
+    if owns_client:
+        collection = get_feeds_collection()
+
+    try:
+        guild_id = str(guild_id)
+        if collection.count_documents({"guild_id": guild_id}) >= MAX_FEEDS_PER_GUILD:
+            raise ValueError(f"This server already has the maximum of {MAX_FEEDS_PER_GUILD} feeds")
+
+        feed = {
+            "guild_id": guild_id,
+            "name": name,
+            "name_key": name.strip().lower(),
+            "url": url,
+            "channel_id": str(channel_id),
+            "created_at": datetime.now(timezone.utc),
+            "created_by": created_by,
+        }
+        try:
+            result = collection.insert_one(feed)
+        except DuplicateKeyError:
+            raise ValueError(f"A feed named '{name}' already exists in this server")
+        feed["_id"] = result.inserted_id
+        return feed
+    finally:
+        if owns_client:
+            collection.database.client.close()
+
+
+def remove_feed(guild_id: str, name: str, collection=None) -> bool:
+    """Delete one guild's feed by name (case-insensitive). Returns whether one was deleted."""
+    owns_client = collection is None
+    if owns_client:
+        collection = get_feeds_collection()
+
+    try:
+        result = collection.delete_one(
+            {"guild_id": str(guild_id), "name_key": name.strip().lower()}
+        )
+        return result.deleted_count > 0
+    finally:
+        if owns_client:
+            collection.database.client.close()
+
+
+def list_feeds(guild_id: str, collection=None) -> list[dict]:
+    """All feeds configured for one guild."""
+    owns_client = collection is None
+    if owns_client:
+        collection = get_feeds_collection()
+
+    try:
+        return list(collection.find({"guild_id": str(guild_id)}))
+    finally:
+        if owns_client:
+            collection.database.client.close()
+
+
+def get_feed(guild_id: str, name: str, collection=None) -> dict | None:
+    """One guild's feed by name (case-insensitive), or None if it doesn't exist."""
+    owns_client = collection is None
+    if owns_client:
+        collection = get_feeds_collection()
+
+    try:
+        return collection.find_one(
+            {"guild_id": str(guild_id), "name_key": name.strip().lower()}
+        )
+    finally:
+        if owns_client:
+            collection.database.client.close()
 
 
 def save_new_jobs(
     jobs: list[dict],
-    feed_name: str,
+    feed: dict,
     jobs_collection=None,
     posted_collection=None,
 ) -> list[dict]:
-    """Store job content once, but track "new" independently per feed.
+    """Store job content once, but track "new" independently per (guild, feed).
 
     Two collections because dedup happens at two different scopes: `jobs` stores
     each listing once no matter how many feeds' filters it matches, while
-    `posted_collection` upserts a (feed, link) row per feed - so a listing that
-    matches two feeds is still reported as new to both, even though the second
-    feed's upsert into `jobs` is a no-op.
+    `posted_collection` upserts a (guild, feed, link) row per feed - so a listing
+    that matches two feeds (in the same or different guilds) is still reported
+    as new to each, even though the second feed's upsert into `jobs` is a no-op.
+    Guild is part of the key (not just feed name) so two servers naming a feed
+    the same thing don't share dedup state.
 
     Uses one bulk_write per collection instead of N round trips, and reads
     upserted_ids back to tell "new to this feed" from "already posted to this
@@ -249,6 +349,9 @@ def save_new_jobs(
     if owns_posted:
         posted_collection = get_posted_collection()
 
+    guild_id = str(feed["guild_id"])
+    feed_id = feed["_id"]
+
     try:
         content_ops = [
             UpdateOne({"link": job["link"]}, {"$setOnInsert": job}, upsert=True)
@@ -262,8 +365,14 @@ def save_new_jobs(
 
         posted_ops = [
             UpdateOne(
-                {"feed": feed_name, "link": job["link"]},
-                {"$setOnInsert": {"feed": feed_name, "link": job["link"]}},
+                {"guild_id": guild_id, "feed_id": feed_id, "link": job["link"]},
+                {
+                    "$setOnInsert": {
+                        "guild_id": guild_id,
+                        "feed_id": feed_id,
+                        "link": job["link"],
+                    }
+                },
                 upsert=True,
             )
             for job in jobs
@@ -283,43 +392,68 @@ def save_new_jobs(
     return [job for i, job in enumerate(jobs) if i in new_indices]
 
 
-def search_jobs(keyword: str, limit: int = 5, collection=None) -> list[dict]:
-    """Case-insensitive substring search over stored jobs, most recently posted first.
+def search_jobs(
+    keyword: str,
+    guild_id: str,
+    limit: int = 5,
+    jobs_collection=None,
+    posted_collection=None,
+) -> list[dict]:
+    """Case-insensitive substring search over jobs actually posted to this guild's
+    feeds, most recently posted first.
 
     Matches against title/company/location/position_type - posted_at is stored as
     an ISO 8601 string (see parse_job_card), which sorts lexicographically the
     same as chronologically, so no datetime parsing is needed here.
+
+    Mongo has no cheap join, so this is a two-step query rather than an
+    aggregation `$lookup` or a denormalized guild list on every job document:
+    first collect the links this guild's feeds have posted (indexed by
+    guild_id), then filter job content down to just those links plus the
+    keyword match. Keeps `jobs` shared/unscoped and per-guild state confined to
+    `posted_collection`, with no extra write path.
     """
-    owns_client = collection is None
-    if owns_client:
-        collection = get_jobs_collection()
+    owns_jobs = jobs_collection is None
+    owns_posted = posted_collection is None
+    if owns_jobs:
+        jobs_collection = get_jobs_collection()
+    if owns_posted:
+        posted_collection = get_posted_collection()
 
     try:
+        links = posted_collection.distinct("link", {"guild_id": str(guild_id)})
+        if not links:
+            return []
+
         pattern = re.compile(re.escape(keyword), re.IGNORECASE)
         query = {
+            "link": {"$in": links},
             "$or": [
                 {"title": pattern},
                 {"company": pattern},
                 {"location": pattern},
                 {"position_type": pattern},
-            ]
+            ],
         }
         cursor = (
-            collection.find(query, {"_id": 0})
+            jobs_collection.find(query, {"_id": 0})
             .sort("posted_at", -1)
             .limit(limit)
         )
         return list(cursor)
     finally:
-        if owns_client:
-            collection.database.client.close()
+        if owns_jobs:
+            jobs_collection.database.client.close()
+        if owns_posted:
+            posted_collection.database.client.close()
 
 
 def scrape_and_store(feed: dict) -> list[dict]:
     """Scrape up to NUM_PAGES of results for one feed, persist, and return newly-posted jobs.
 
-    "New" is tracked per feed (see save_new_jobs), so the same listing can be
-    returned for more than one feed if it matches more than one feed's filters.
+    "New" is tracked per (guild, feed) - see save_new_jobs - so the same
+    listing can be returned for more than one feed if it matches more than one
+    feed's filters, including feeds belonging to different guilds.
     """
     htmls = fetch_pages(NUM_PAGES, feed["url"])
 
@@ -328,7 +462,7 @@ def scrape_and_store(feed: dict) -> list[dict]:
     for html in htmls:
         jobs.extend(extract_jobs(html, feed["url"], seen_links))
 
-    new_jobs = save_new_jobs(jobs, feed["name"])
+    new_jobs = save_new_jobs(jobs, feed)
 
     max_age_hours = int(MAX_AGE.total_seconds() // 3600)
     print(
@@ -339,17 +473,25 @@ def scrape_and_store(feed: dict) -> list[dict]:
 
 
 def main():
-    if not FEEDS:
-        print("No feeds configured - add entries to feeds.json")
+    """Manual one-off run for a single guild's feeds - the bot itself calls
+    scrape_and_store directly per guild (see discord_bot.py's poll_jobs)."""
+    if len(sys.argv) < 2:
+        print("Usage: python test_scraper.py <guild_id>")
         return
 
-    results = {feed["name"]: scrape_and_store(feed) for feed in FEEDS}
+    guild_id = sys.argv[1]
+    feeds = list_feeds(guild_id)
+    if not feeds:
+        print(f"No feeds configured for guild {guild_id}")
+        return
+
+    results = {feed["name"]: scrape_and_store(feed) for feed in feeds}
 
     with open(OUTPUT_FILE, "w") as f:
         json.dump(results, f, indent=2)
 
     total_new = sum(len(jobs) for jobs in results.values())
-    print(f"Wrote {total_new} new job listing(s) across {len(FEEDS)} feed(s) to {OUTPUT_FILE}")
+    print(f"Wrote {total_new} new job listing(s) across {len(feeds)} feed(s) to {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
