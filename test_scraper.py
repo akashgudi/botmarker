@@ -55,28 +55,32 @@ POSTED_COLLECTION = os.environ.get("MONGO_POSTED_COLLECTION", "posted_jobs")
 # discord_bot.py's slash commands rather than editing a shared file.
 FEEDS_COLLECTION = os.environ.get("MONGO_FEEDS_COLLECTION", "feeds")
 
-# CSS path to the job list container, copied from the rendered DOM (hitmarker.net
-# is a client-rendered SPA, so this is Tailwind's generated classes, not
-# hand-written markup - backslashes escape the ':' and '[...]' inside class names).
-JOB_LIST_SELECTOR = (
-    "#app > div.px-4.md\\:px-8.mt-8 > div > "
-    "div.grid.grid-cols-1.lg\\:grid-cols-\\[minmax\\(0\\,1fr\\)_300px\\]."
-    "xl\\:grid-cols-\\[300px_minmax\\(0\\,1fr\\)_300px\\].gap-x-6 > "
-    "div:nth-child(2) > div > div:nth-child(3) > div.space-y-3"
-)
+# CSS selector for the job list container. hitmarker.net is a client-rendered
+# SPA with Tailwind-generated utility classes that get regenerated on every
+# redesign, so nth-child/utility-class chains rot fast - `jobs-results-col`
+# is the one hand-written, semantic class in the container's ancestry and is
+# unique on the page, which makes it the stable anchor to select from.
+JOB_LIST_SELECTOR = ".jobs-results-col"
+# Each job card is an <article> whose whole-card link is an absolutely
+# positioned <a> overlaying it (not a wrapper around the card's content), so
+# selectors need to reach into the article rather than treat the anchor as
+# the card root.
+JOB_CARD_SELECTOR = f"{JOB_LIST_SELECTOR} article"
 # Wait for an actual job link, not just the container - the container div
 # exists (as a skeleton/loading state) before the async data fetch resolves,
 # so waiting on it alone races with real content and can grab placeholders.
-WAIT_FOR_SELECTOR = f"{JOB_LIST_SELECTOR} a"
-# Pagination is a client-side <nav> with plain <button>N</button> controls -
-# there's no page= query param or href, so pages must be clicked through
-# within a single session rather than requested as separate URLs.
-PAGINATION_SELECTOR = f"{JOB_LIST_SELECTOR} > nav"
+WAIT_FOR_SELECTOR = f"{JOB_CARD_SELECTOR} a[href*='/jobs/']"
+# Pagination is a client-side <nav> with plain <button>N</button> controls (the
+# current page is a <span aria-current="page"> instead of a button) - there's
+# no page= query param or href, so pages must be clicked through within a
+# single session rather than requested as separate URLs. The aria-label is a
+# stable, semantic hook rather than another utility-class chain.
+PAGINATION_SELECTOR = "nav[aria-label='Pagination']"
 MAX_AGE = timedelta(hours=48)
 # ------------------------------------------------------------------------
 
 
-FIRST_JOB_LINK_SELECTOR = f"{JOB_LIST_SELECTOR} a[href*='/jobs/']"
+FIRST_JOB_LINK_SELECTOR = f"{JOB_LIST_SELECTOR} article:first-of-type a[href*='/jobs/']"
 
 
 def fetch_pages(num_pages: int, target_url: str) -> list[str]:
@@ -114,11 +118,9 @@ def fetch_pages(num_pages: int, target_url: str) -> list[str]:
     return htmls
 
 
-def parse_job_card(anchor, base_url: str) -> dict:
+def parse_job_card(article, anchor, base_url: str) -> dict:
     link = urljoin(base_url, anchor["href"])
-
-    title_el = anchor.select_one("span.font-bold")
-    title = title_el.get_text(strip=True) if title_el else None
+    title = anchor.get("aria-label")
 
     job = {
         "title": title,
@@ -132,32 +134,34 @@ def parse_job_card(anchor, base_url: str) -> dict:
         "link": link,
     }
 
-    # Each job card row is an icon + label pair (location emoji, company logo,
-    # contract type, salary, post date) - there's no data attribute naming the
-    # field, so the icon's alt text / class is the only way to tell rows apart.
-    for row in anchor.find_all("div", class_=lambda c: c == "gap-x-1.5"):
-        img = row.find("img")
-        truncate_el = row.select_one("span.truncate")
-        text = truncate_el.get_text(strip=True) if truncate_el else None
-        if img is None or not text:
-            continue
+    logo_img = article.select_one("img[alt$=' logo']")
+    if logo_img is not None:
+        job["company_logo"] = urljoin(base_url, logo_img["src"]) if logo_img.get("src") else None
+        alt = logo_img.get("alt", "")
+        job["company"] = alt[: -len(" logo")] if alt.endswith(" logo") else None
 
-        alt = img.get("alt", "")
-        classes = img.get("class") or []
+    # The two detail rows have no icons or data attributes naming the field
+    # anymore, just plain text in a fixed order - company/location, then
+    # contract type/salary - so position within the row is the only way to
+    # tell them apart.
+    rows = article.select("div.mt-0\\.5 > div")
+    if len(rows) > 0:
+        texts = [s.get_text(strip=True) for s in rows[0].select("span.truncate")]
+        if texts:
+            job["company"] = job["company"] or texts[0]
+        if len(texts) > 1:
+            job["location"] = texts[1]
+    if len(rows) > 1:
+        texts = [s.get_text(strip=True) for s in rows[1].select("span.truncate")]
+        if texts:
+            job["position_type"] = texts[0]
+        if len(texts) > 1:
+            job["compensation"] = texts[1]
 
-        if "emoji" in classes:
-            job["location"] = text
-        elif alt.endswith(" logo"):
-            job["company"] = text
-            if img.get("src"):
-                job["company_logo"] = urljoin(base_url, img["src"])
-        elif alt == "Contract":
-            job["position_type"] = text
-        elif alt == "Salary":
-            job["compensation"] = text
-        elif alt == "Post Date":
-            job["date_posted"] = text
-            job["posted_at"] = truncate_el.get("data-datetime")
+    date_el = article.select_one("span[data-datetime]")
+    if date_el is not None:
+        job["date_posted"] = date_el.get_text(strip=True)
+        job["posted_at"] = date_el.get("data-datetime")
 
     return job
 
@@ -190,7 +194,15 @@ def extract_jobs(html: str, base_url: str, seen_links: set | None = None) -> lis
         print("Warning: job list container not found, falling back to whole-page scan")
         job_list = soup
 
-    for anchor in job_list.find_all("a", href=True):
+    # Job cards are <article> elements; the card's link is an absolutely
+    # positioned <a> overlaying the article rather than a wrapper around its
+    # content, so the anchor and its surrounding details have to be looked up
+    # separately (see parse_job_card).
+    for article in job_list.find_all("article"):
+        anchor = article.find("a", href=True)
+        if anchor is None:
+            continue
+
         absolute_url = urljoin(base_url, anchor["href"])
         path = urlparse(absolute_url).path
 
@@ -201,7 +213,7 @@ def extract_jobs(html: str, base_url: str, seen_links: set | None = None) -> lis
             continue
 
         seen_links.add(absolute_url)
-        job = parse_job_card(anchor, base_url)
+        job = parse_job_card(article, anchor, base_url)
         if posted_within(job, MAX_AGE):
             jobs.append(job)
 
